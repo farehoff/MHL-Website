@@ -1,0 +1,1 @@
+{"name":"mhl-cloudflare-pages","private":true,"scripts":{"deploy":"wrangler pages deploy public --project-name mhl-trondelag"},"devDependencies":{"wrangler":"^4.0.0"}}
