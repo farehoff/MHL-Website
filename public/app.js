@@ -463,7 +463,7 @@
           </div>
           <div class="history-score">${gf}-${ga}</div>
           <div class="history-extra">${goalEvents} scoringer registrert</div>
-        </a>
+        </article>
       `;
     }).join('')}</div>`;
   }
@@ -733,6 +733,18 @@
                 <button class="btn" type="submit">Opprett kamp</button>
               </form>
             </article>
+            ${(state.matches||[]).some(m=>!m.fixtureId) ? `
+            <article class="panel admin-panel admin-wide">
+              <div class="panel-header"><h3>Koble eksisterende kamprapport</h3></div>
+              <form id="link-match-form" class="stack-form">
+                <p class="form-hint">Disse kamprapportene er ikke koblet til terminlisten. Koble rapporten til riktig kamp før du registrerer resultatet på nytt. Mål og utvisninger beholdes.</p>
+                <label>Eksisterende rapport<select name="matchId" required><option value="">Velg rapport</option>${state.matches.filter(m=>!m.fixtureId).map(m=>`<option value="${e(m.id)}">${e(getTeam(m.home)?.name)} ${e(m.homeGoals)}–${e(m.awayGoals)} ${e(getTeam(m.away)?.name)} · ${e(formatDate(m.date))} · ${e(m.label)} · ${(m.goalEvents||[]).length} scoringer, ${(m.penalties||[]).length} utvisninger</option>`).join('')}</select></label>
+                <label>Kamp i terminlisten<select name="fixtureId" required><option value="">Velg rapport først</option></select></label>
+                <p class="form-hint">Velg riktig dato. Finnes allerede en rapport på kampen, slås oppføringene sammen bare når resultat og hendelser er forenlige.</p>
+                <p id="link-status" class="form-hint" role="status" aria-live="polite"></p>
+                <button class="btn" type="submit">Koble rapport til kamp</button>
+              </form>
+            </article>` : ''}
             ${adminGalleryMarkup()}
             <article class="panel admin-panel">
               <div class="panel-header"><h3>Ny publisering</h3></div>
@@ -908,6 +920,28 @@
       return;
     }
 
+    if (form.id === 'link-match-form') {
+      event.preventDefault();
+      if (saving) return;
+      const data = new FormData(form);
+      const matchId = String(data.get('matchId')||'');
+      const fixtureId = String(data.get('fixtureId')||'');
+      const match = state.matches.find(m=>m.id===matchId);
+      const fixture = state.fixtures.find(f=>f.id===fixtureId);
+      if (!match || !fixture) return;
+      if (!confirm(`Koble ${getTeam(match.home)?.name} ${match.homeGoals}–${match.awayGoals} ${getTeam(match.away)?.name} til kampen ${formatDate(fixture.date)} kl. ${fixture.time}? Eventuell dobbeltføring slås sammen, og hendelsene beholdes.`)) return;
+      saving = true;
+      const button = form.querySelector('button[type="submit"]'); button.disabled = true;
+      const status = form.querySelector('#link-status'); status.textContent = 'Kobler rapporten …';
+      try {
+        const result = await fetchJSON('/api/link-match',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision,matchId,fixtureId})});
+        state = result.data; revision = result.revision; route();
+        alert('Rapporten er koblet til terminlisten. Kampen telles én gang.');
+      } catch(error) { status.textContent = 'Kobling mislyktes: '+error.message; }
+      finally { saving = false; button.disabled = false; }
+      return;
+    }
+
     if (form.id === 'post-form') {
       event.preventDefault();
       const data = new FormData(form);
@@ -946,6 +980,8 @@
       const fixtureId=String(data.get('fixtureId')||'');
       const fixture=(state.fixtures||[]).find(f=>f.id===fixtureId);
       if(!fixture){alert('Velg en kamp fra terminlisten.');return;}
+      const unlinked = state.matches.filter(m=>!m.fixtureId && (!m.date || m.date===fixture.date) && ((m.home===fixture.home&&m.away===fixture.away)||(m.home===fixture.away&&m.away===fixture.home)));
+      if (unlinked.length && !confirm('Det finnes en eldre kamprapport mellom disse lagene som ikke er koblet til terminlisten. Er dette en annen kamp? Velg Avbryt og bruk «Koble eksisterende kamprapport» hvis det er samme kamp.')) return;
       const home = fixture.home;
       const away = fixture.away;
       if (!home || !away || home === away) {
@@ -1015,6 +1051,13 @@
   });
 
   document.addEventListener('change', event => {
+    if(event.target.name==='matchId' && event.target.closest('#link-match-form')) {
+      const form=event.target.closest('form');
+      const match=state.matches.find(m=>m.id===event.target.value);
+      const fixtures=match ? state.fixtures.filter(f=>(f.home===match.home&&f.away===match.away)||(f.home===match.away&&f.away===match.home)) : [];
+      form.querySelector('[name="fixtureId"]').innerHTML='<option value="">Velg riktig kamp og dato</option>'+fixtures.slice().sort((a,b)=>a.date.localeCompare(b.date)||a.time.localeCompare(b.time)).map(f=>`<option value="${e(f.id)}">${e(formatDate(f.date))} ${e(f.time)} · ${e(getTeam(f.home)?.name)} – ${e(getTeam(f.away)?.name)} · ${e(f.venue)}</option>`).join('');
+      return;
+    }
     if(event.target.id==='admin-fixture-select') {
       const f=(state.fixtures||[]).find(x=>x.id===event.target.value);
       const form=document.getElementById('match-form');

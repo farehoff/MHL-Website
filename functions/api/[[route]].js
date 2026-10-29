@@ -103,6 +103,40 @@ export async function onRequest(context) {
    if(!requireOrigin(request))return fail('Ugyldig forespørselsopprinnelse',403);
    return response({authenticated:false},200,{'Set-Cookie':`${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`});
   }
+  if(method==='POST' && path==='link-match'){
+   if(!requireOrigin(request))return fail('Ugyldig forespørselsopprinnelse',403);
+   if(!await authed(request,env))return fail('Krever admininnlogging',401);
+   const input=await jsonBody(request);
+   if(!Number.isInteger(input.revision)||input.revision<1)return fail('Revisjonsnummer mangler');
+   const row=await env.DB.prepare('SELECT payload,revision FROM site_state WHERE id=1').first();
+   if(!row)return fail('Databasen er ikke initialisert',503);
+   if(row.revision!==input.revision)return fail('Andre har endret dataene. Last siden på nytt.',409);
+   const data=JSON.parse(row.payload);
+   const source=data.matches.find(m=>m.id===input.matchId);
+   const fixture=data.fixtures.find(f=>f.id===input.fixtureId);
+   if(!source||!fixture)return fail('Rapporten eller kampen finnes ikke',404);
+   if(source.fixtureId)return fail('Rapporten er allerede koblet til en kamp',409);
+   if(!((source.home===fixture.home&&source.away===fixture.away)||(source.home===fixture.away&&source.away===fixture.home)))return fail('Rapporten og kampen må ha de samme lagene');
+   if(source.date&&source.date!==fixture.date)return fail('Rapporten og kampen har ulike datoer. Kontroller oppføringene før kobling.',409);
+   const targets=data.matches.filter(m=>m.fixtureId===fixture.id);
+   if(targets.length>1)return fail('Flere rapporter er koblet til denne kampen. Eksporter data for gjennomgang.',409);
+   const target=targets[0];
+   const homeGoals=source.home===fixture.home?source.homeGoals:source.awayGoals;
+   const awayGoals=source.away===fixture.away?source.awayGoals:source.homeGoals;
+   if(target&&(target.home!==fixture.home||target.away!==fixture.away||target.homeGoals!==homeGoals||target.awayGoals!==awayGoals))return fail('Resultatene stemmer ikke overens. Kontroller dem før sammenslåing.',409);
+   const events={};
+   for(const field of ['goalEvents','penalties']){
+    const a=source[field]||[],b=target?.[field]||[];
+    if(a.length&&b.length&&JSON.stringify(a)!==JSON.stringify(b))return fail('Begge rapportene har ulike hendelser. Eksporter data for gjennomgang; ingen data er endret.',409);
+    events[field]=b.length?b:a;
+   }
+   const merged={...source,...(target||{}),...events,id:target?.id||source.id,fixtureId:fixture.id,date:fixture.date,home:fixture.home,away:fixture.away,homeGoals,awayGoals,label:target?.label||((fixture.round?'Runde '+fixture.round:'Ligakamp')+' · '+fixture.venue)};
+   data.matches=data.matches.filter(m=>m.id!==source.id&&m.id!==target?.id);
+   data.matches.unshift(merged);
+   const result=await env.DB.prepare('UPDATE site_state SET payload=?, revision=revision+1, updated_at=CURRENT_TIMESTAMP WHERE id=1 AND revision=?').bind(JSON.stringify(data),row.revision).run();
+   if(result.meta.changes!==1)return fail('Andre har endret dataene. Last siden på nytt.',409);
+   return response({ok:true,data,revision:row.revision+1});
+  }
   if(method==='POST' && path==='fixtures'){
    if(!requireOrigin(request))return fail('Ugyldig forespørselsopprinnelse',403);
    if(!await authed(request,env))return fail('Krever admininnlogging',401);
