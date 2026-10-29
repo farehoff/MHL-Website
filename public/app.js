@@ -713,6 +713,26 @@
       <section class="section">
         <div class="container admin-grid">
           ${loggedIn ? `
+            <article class="panel admin-panel admin-wide">
+              <div class="panel-header"><h3>Ny kamp</h3></div>
+              <form id="fixture-form" class="stack-form">
+                <p class="form-hint">Legg til en kamp i terminlisten. Du kan også legge til kamper som allerede er spilt, og registrere resultatet etterpå.</p>
+                <div class="field-grid two">
+                  <label>Hjemmelag<select name="home" required><option value="">Velg hjemmelag</option>${teamOptions('')}</select></label>
+                  <label>Bortelag<select name="away" required><option value="">Velg bortelag</option>${teamOptions('')}</select></label>
+                </div>
+                <div class="field-grid two">
+                  <label>Dato<input type="date" name="date" required></label>
+                  <label>Klokkeslett<input type="time" name="time" required></label>
+                </div>
+                <div class="field-grid two">
+                  <label>Hall<input type="text" name="venue" maxlength="120" required placeholder="F.eks. Leangen ungdomshall"></label>
+                  <label>Runde (valgfritt)<input type="number" name="round" min="1" max="999" step="1"></label>
+                </div>
+                <p id="fixture-status" class="form-hint" role="status" aria-live="polite"></p>
+                <button class="btn" type="submit">Opprett kamp</button>
+              </form>
+            </article>
             ${adminGalleryMarkup()}
             <article class="panel admin-panel">
               <div class="panel-header"><h3>Ny publisering</h3></div>
@@ -861,6 +881,33 @@
       return;
     }
 
+    if (form.id === 'fixture-form') {
+      event.preventDefault();
+      if (saving) return;
+      const data = new FormData(form);
+      const input = Object.fromEntries(['home','away','date','time','venue','round'].map(key => [key,String(data.get(key)||'').trim()]));
+      const status = form.querySelector('#fixture-status');
+      if (!input.home || !input.away || input.home === input.away) {
+        status.textContent = 'Velg to ulike lag.'; return;
+      }
+      const button = form.querySelector('button[type="submit"]');
+      saving = true; button.disabled = true; status.textContent = 'Lagrer kampen …';
+      try {
+        const result = await fetchJSON('/api/fixtures', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...input,revision})});
+        state = result.data; revision = result.revision;
+        route();
+        const select = document.getElementById('admin-fixture-select');
+        select.value = result.fixture.id;
+        select.dispatchEvent(new Event('change',{bubbles:true}));
+        document.getElementById('fixture-status').textContent = 'Kampen er opprettet og vises i terminlisten. Du kan registrere resultatet nedenfor nå eller senere.';
+        document.getElementById('match-form').scrollIntoView({behavior:'smooth',block:'start'});
+        select.focus({preventScroll:true});
+      } catch (error) {
+        status.textContent = 'Kampen ble ikke opprettet: ' + error.message;
+      } finally { saving = false; button.disabled = false; }
+      return;
+    }
+
     if (form.id === 'post-form') {
       event.preventDefault();
       const data = new FormData(form);
@@ -949,7 +996,7 @@
       const updated={
         id: old?.id || `match-${Date.now().toString(36)}`,
         fixtureId,
-        label: String(data.get('label') || '').trim() || `Runde ${fixture.round}`,
+        label: String(data.get('label') || '').trim() || (fixture.round ? `Runde ${fixture.round}` : 'Ligakamp'),
         date: fixture.date,
         home,
         away,
@@ -976,7 +1023,7 @@
       form.querySelector('[name="home"]').value=f.home;
       form.querySelector('[name="away"]').value=f.away;
       form.querySelector('[name="date"]').value=f.date;
-      form.querySelector('[name="label"]').value='Runde '+f.round+' · '+f.venue;
+      form.querySelector('[name="label"]').value=(f.round ? 'Runde '+f.round : 'Ligakamp')+' · '+f.venue;
       form.querySelector('[name="homeGoals"]').value=old?.homeGoals??'';
       form.querySelector('[name="awayGoals"]').value=old?.awayGoals??'';
       const alertBox=document.getElementById('match-existing-hint');

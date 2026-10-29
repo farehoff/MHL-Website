@@ -103,6 +103,33 @@ export async function onRequest(context) {
    if(!requireOrigin(request))return fail('Ugyldig forespørselsopprinnelse',403);
    return response({authenticated:false},200,{'Set-Cookie':`${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`});
   }
+  if(method==='POST' && path==='fixtures'){
+   if(!requireOrigin(request))return fail('Ugyldig forespørselsopprinnelse',403);
+   if(!await authed(request,env))return fail('Krever admininnlogging',401);
+   const input=await jsonBody(request);
+   if(!Number.isInteger(input.revision)||input.revision<1)return fail('Revisjonsnummer mangler');
+   const home=String(input.home||'').trim(),away=String(input.away||'').trim();
+   const date=String(input.date||'').trim(),time=String(input.time||'').trim(),venue=String(input.venue||'').trim();
+   const round=input.round===''||input.round==null?null:Number(input.round);
+   if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!Number.isFinite(Date.parse(date+'T12:00:00Z'))||new Date(date+'T12:00:00Z').toISOString().slice(0,10)!==date)return fail('Velg en gyldig dato');
+   if(!/^([01]\d|2[0-3]):[0-5]\d$/.test(time))return fail('Velg et gyldig klokkeslett');
+   if(!venue||venue.length>120)return fail('Hall må være mellom 1 og 120 tegn');
+   if(round!==null&&(!Number.isInteger(round)||round<1||round>999))return fail('Runde må være et heltall mellom 1 og 999');
+   const row=await env.DB.prepare('SELECT payload,revision FROM site_state WHERE id=1').first();
+   if(!row)return fail('Databasen er ikke initialisert',503);
+   if(row.revision!==input.revision)return fail('Andre har endret dataene. Last siden på nytt før du oppretter kampen.',409);
+   const data=JSON.parse(row.payload);
+   if(!home||home===away||!data.teams.some(t=>t.id===home)||!data.teams.some(t=>t.id===away))return fail('Velg to ulike lag fra ligaen');
+   const fixtures=data.fixtures||[];
+   if(fixtures.some(f=>f.date===date&&f.time===time&&((f.home===home&&f.away===away)||(f.home===away&&f.away===home))))return fail('Disse lagene har allerede en kamp på samme dato og klokkeslett. Velg den eksisterende kampen i statistikkregistreringen.',409);
+   const fixture={id:'fixture-'+crypto.randomUUID(),home,away,date,time,venue,round};
+   data.fixtures=[...fixtures,fixture];
+   const payload=JSON.stringify(data);
+   if(payload.length>900000)return fail('Datasettet er for stort');
+   const result=await env.DB.prepare('UPDATE site_state SET payload=?, revision=revision+1, updated_at=CURRENT_TIMESTAMP WHERE id=1 AND revision=?').bind(payload,row.revision).run();
+   if(result.meta.changes!==1)return fail('Andre har endret dataene. Last siden på nytt før du oppretter kampen.',409);
+   return response({ok:true,fixture,data,revision:row.revision+1},201);
+  }
   if(method==='PUT' && path==='state'){
    if(!requireOrigin(request))return fail('Ugyldig forespørselsopprinnelse',403);
    if(!await authed(request,env))return fail('Krever admininnlogging',401);
