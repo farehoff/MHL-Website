@@ -120,7 +120,7 @@
   function ensurePlayer(teamId, number) {
     const normalized = Number(number);
     if (!teamId || !Number.isFinite(normalized)) return null;
-    const existing = state.players.find(player => player.teamId === teamId && Number(player.number) === normalized);
+    const existing = state.players.find(player => player.teamId === teamId && player.number != null && Number(player.number) === normalized);
     if (existing) return existing.id;
     const team = getTeam(teamId);
     const id = `${teamId}-${normalized}-${Date.now().toString(36)}`;
@@ -463,7 +463,7 @@
           </div>
           <div class="history-score">${gf}-${ga}</div>
           <div class="history-extra">${goalEvents} scoringer registrert</div>
-        </article>
+        </a>
       `;
     }).join('')}</div>`;
   }
@@ -713,38 +713,6 @@
       <section class="section">
         <div class="container admin-grid">
           ${loggedIn ? `
-            <article class="panel admin-panel admin-wide">
-              <div class="panel-header"><h3>Ny kamp</h3></div>
-              <form id="fixture-form" class="stack-form">
-                <p class="form-hint">Legg til en kamp i terminlisten. Du kan også legge til kamper som allerede er spilt, og registrere resultatet etterpå.</p>
-                <div class="field-grid two">
-                  <label>Hjemmelag<select name="home" required><option value="">Velg hjemmelag</option>${teamOptions('')}</select></label>
-                  <label>Bortelag<select name="away" required><option value="">Velg bortelag</option>${teamOptions('')}</select></label>
-                </div>
-                <div class="field-grid two">
-                  <label>Dato<input type="date" name="date" required></label>
-                  <label>Klokkeslett<input type="time" name="time" required></label>
-                </div>
-                <div class="field-grid two">
-                  <label>Hall<input type="text" name="venue" maxlength="120" required placeholder="F.eks. Leangen ungdomshall"></label>
-                  <label>Runde (valgfritt)<input type="number" name="round" min="1" max="999" step="1"></label>
-                </div>
-                <p id="fixture-status" class="form-hint" role="status" aria-live="polite"></p>
-                <button class="btn" type="submit">Opprett kamp</button>
-              </form>
-            </article>
-            ${(state.matches||[]).some(m=>!m.fixtureId) ? `
-            <article class="panel admin-panel admin-wide">
-              <div class="panel-header"><h3>Koble eksisterende kamprapport</h3></div>
-              <form id="link-match-form" class="stack-form">
-                <p class="form-hint">Disse kamprapportene er ikke koblet til terminlisten. Koble rapporten til riktig kamp før du registrerer resultatet på nytt. Mål og utvisninger beholdes.</p>
-                <label>Eksisterende rapport<select name="matchId" required><option value="">Velg rapport</option>${state.matches.filter(m=>!m.fixtureId).map(m=>`<option value="${e(m.id)}">${e(getTeam(m.home)?.name)} ${e(m.homeGoals)}–${e(m.awayGoals)} ${e(getTeam(m.away)?.name)} · ${e(formatDate(m.date))} · ${e(m.label)} · ${(m.goalEvents||[]).length} scoringer, ${(m.penalties||[]).length} utvisninger</option>`).join('')}</select></label>
-                <label>Kamp i terminlisten<select name="fixtureId" required><option value="">Velg rapport først</option></select></label>
-                <p class="form-hint">Velg riktig dato. Finnes allerede en rapport på kampen, slås oppføringene sammen bare når resultat og hendelser er forenlige.</p>
-                <p id="link-status" class="form-hint" role="status" aria-live="polite"></p>
-                <button class="btn" type="submit">Koble rapport til kamp</button>
-              </form>
-            </article>` : ''}
             ${adminGalleryMarkup()}
             <article class="panel admin-panel">
               <div class="panel-header"><h3>Ny publisering</h3></div>
@@ -798,15 +766,17 @@
             <article class="panel admin-panel">
               <div class="panel-header"><h3>Spiller og kaptein</h3></div>
               <form id="player-form" class="stack-form">
+                <label>Handling<select name="playerId" id="admin-player-select"><option value="">+ Opprett ny spiller</option>${state.players.slice().sort((a,b)=>((getTeam(a.teamId)?.name||'').localeCompare(getTeam(b.teamId)?.name||''))||a.name.localeCompare(b.name)).map(p=>`<option value="${e(p.id)}">${e(getTeam(p.teamId)?.name||'Ukjent lag')} · ${e(p.name)}${p.number!=null?' (#'+e(p.number)+')':''}</option>`).join('')}</select></label>
                 <label>Lag<select name="teamId" required>${teamOptions(state.teams[0]?.id)}</select></label>
-                <label>Draktnummer<input type="number" name="number" min="0" required></label>
+                <label>Draktnummer (valgfritt)<input type="number" name="number" min="0" placeholder="Ikke registrert"></label>
                 <label>Spillernavn<input type="text" name="name" placeholder="Fornavn Etternavn" required></label>
                 <label>Posisjon<select name="position"><option value="F">Løper</option><option value="D">Back</option><option value="GK">Målvakt</option></select></label>
                 <label>Shutouts (målvakt)<input type="number" name="shutouts" min="0" value="0"></label>
-                <label class="checkbox"><input type="checkbox" name="captain"> Sett som lagkaptein</label>
+                <label class="checkbox"><input type="checkbox" name="captain"> Lagkaptein på valgt lag</label>
                 <button class="btn" type="submit">Lagre spiller</button>
+                <button class="ghost-btn" type="button" data-action="delete-player">Slett valgt spiller (kun uten kampstatistikk)</button>
               </form>
-              <p class="admin-note">Samme lag og draktnummer oppdaterer eksisterende spiller. Keeperens shutouts registreres manuelt.</p>
+              <p class="admin-note">Velg en eksisterende spiller for å endre lag, nummer eller kapteinstatus uten å opprette en ny. Den faste spiller-ID-en og statistikken beholdes. Bruk «Opprett ny spiller» bare for nye personer.</p>
             </article>
             <article class="panel admin-panel">
               <div class="panel-header"><h3>Dataverktøy</h3></div>
@@ -893,55 +863,6 @@
       return;
     }
 
-    if (form.id === 'fixture-form') {
-      event.preventDefault();
-      if (saving) return;
-      const data = new FormData(form);
-      const input = Object.fromEntries(['home','away','date','time','venue','round'].map(key => [key,String(data.get(key)||'').trim()]));
-      const status = form.querySelector('#fixture-status');
-      if (!input.home || !input.away || input.home === input.away) {
-        status.textContent = 'Velg to ulike lag.'; return;
-      }
-      const button = form.querySelector('button[type="submit"]');
-      saving = true; button.disabled = true; status.textContent = 'Lagrer kampen …';
-      try {
-        const result = await fetchJSON('/api/fixtures', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...input,revision})});
-        state = result.data; revision = result.revision;
-        route();
-        const select = document.getElementById('admin-fixture-select');
-        select.value = result.fixture.id;
-        select.dispatchEvent(new Event('change',{bubbles:true}));
-        document.getElementById('fixture-status').textContent = 'Kampen er opprettet og vises i terminlisten. Du kan registrere resultatet nedenfor nå eller senere.';
-        document.getElementById('match-form').scrollIntoView({behavior:'smooth',block:'start'});
-        select.focus({preventScroll:true});
-      } catch (error) {
-        status.textContent = 'Kampen ble ikke opprettet: ' + error.message;
-      } finally { saving = false; button.disabled = false; }
-      return;
-    }
-
-    if (form.id === 'link-match-form') {
-      event.preventDefault();
-      if (saving) return;
-      const data = new FormData(form);
-      const matchId = String(data.get('matchId')||'');
-      const fixtureId = String(data.get('fixtureId')||'');
-      const match = state.matches.find(m=>m.id===matchId);
-      const fixture = state.fixtures.find(f=>f.id===fixtureId);
-      if (!match || !fixture) return;
-      if (!confirm(`Koble ${getTeam(match.home)?.name} ${match.homeGoals}–${match.awayGoals} ${getTeam(match.away)?.name} til kampen ${formatDate(fixture.date)} kl. ${fixture.time}? Eventuell dobbeltføring slås sammen, og hendelsene beholdes.`)) return;
-      saving = true;
-      const button = form.querySelector('button[type="submit"]'); button.disabled = true;
-      const status = form.querySelector('#link-status'); status.textContent = 'Kobler rapporten …';
-      try {
-        const result = await fetchJSON('/api/link-match',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({revision,matchId,fixtureId})});
-        state = result.data; revision = result.revision; route();
-        alert('Rapporten er koblet til terminlisten. Kampen telles én gang.');
-      } catch(error) { status.textContent = 'Kobling mislyktes: '+error.message; }
-      finally { saving = false; button.disabled = false; }
-      return;
-    }
-
     if (form.id === 'post-form') {
       event.preventDefault();
       const data = new FormData(form);
@@ -961,17 +882,36 @@
     if (form.id === 'player-form') {
       event.preventDefault();
       const data = new FormData(form);
+      const selectedId = String(data.get('playerId') || '');
       const teamId = String(data.get('teamId') || '');
-      const number = Number(data.get('number'));
+      const rawNumber = String(data.get('number') || '').trim();
+      const number = rawNumber === '' ? null : Number(rawNumber);
       const name = String(data.get('name') || '').trim();
-      if (!getTeam(teamId) || !Number.isFinite(number) || !name) return;
-      const id = ensurePlayer(teamId, number);
-      const player = getPlayer(id);
-      player.name = name;
-      player.position = String(data.get('position') || 'F');
-      player.shutouts = Number(data.get('shutouts') || 0);
-      if (data.get('captain') === 'on') getTeam(teamId).captainId = id;
-      await saveData(); route(); return;
+      if (!getTeam(teamId) || !name || (number !== null && (!Number.isInteger(number) || number < 0))) {
+        alert('Kontroller lag, navn og draktnummer.'); return;
+      }
+      const normalized = n => n.normalize('NFKC').trim().replace(/\s+/g,' ').toLocaleLowerCase('nb');
+      const nameCollision=state.players.find(p=>p.id!==selectedId && p.teamId===teamId && normalized(p.name)===normalized(name));
+      if (nameCollision) {alert('Det finnes allerede en spiller med dette navnet på laget. Velg spilleren i listen for å redigere.');return;}
+      const numberCollision = number !== null && state.players.find(p=>p.id!==selectedId && p.teamId===teamId && p.number!=null && Number(p.number)===number);
+      if(numberCollision) {alert('Draktnummeret brukes allerede på dette laget av '+numberCollision.name+'. Kontroller nummeret eller rediger riktig spiller.');return;}
+      let player;
+      if (selectedId) {
+        player=getPlayer(selectedId);
+        if(!player){alert('Spilleren finnes ikke lenger. Last inn siden på nytt.');return;}
+        const formerTeam=getTeam(player.teamId);
+        if(formerTeam?.captainId===player.id && (player.teamId!==teamId || data.get('captain')!=='on')) formerTeam.captainId=null;
+      } else {
+        player={id:'player-'+crypto.randomUUID(),teamId,name,number,position:'F',shutouts:0};
+        state.players.push(player);
+      }
+      player.teamId=teamId;
+      player.name=name;
+      player.number=number;
+      player.position=String(data.get('position')||'F');
+      player.shutouts=Number(data.get('shutouts')||0);
+      if(data.get('captain')==='on') getTeam(teamId).captainId=player.id;
+      await saveData();route();return;
     }
 
     if (form.id === 'match-form') {
@@ -980,8 +920,6 @@
       const fixtureId=String(data.get('fixtureId')||'');
       const fixture=(state.fixtures||[]).find(f=>f.id===fixtureId);
       if(!fixture){alert('Velg en kamp fra terminlisten.');return;}
-      const unlinked = state.matches.filter(m=>!m.fixtureId && (!m.date || m.date===fixture.date) && ((m.home===fixture.home&&m.away===fixture.away)||(m.home===fixture.away&&m.away===fixture.home)));
-      if (unlinked.length && !confirm('Det finnes en eldre kamprapport mellom disse lagene som ikke er koblet til terminlisten. Er dette en annen kamp? Velg Avbryt og bruk «Koble eksisterende kamprapport» hvis det er samme kamp.')) return;
       const home = fixture.home;
       const away = fixture.away;
       if (!home || !away || home === away) {
@@ -1032,7 +970,7 @@
       const updated={
         id: old?.id || `match-${Date.now().toString(36)}`,
         fixtureId,
-        label: String(data.get('label') || '').trim() || (fixture.round ? `Runde ${fixture.round}` : 'Ligakamp'),
+        label: String(data.get('label') || '').trim() || `Runde ${fixture.round}`,
         date: fixture.date,
         home,
         away,
@@ -1051,13 +989,6 @@
   });
 
   document.addEventListener('change', event => {
-    if(event.target.name==='matchId' && event.target.closest('#link-match-form')) {
-      const form=event.target.closest('form');
-      const match=state.matches.find(m=>m.id===event.target.value);
-      const fixtures=match ? state.fixtures.filter(f=>(f.home===match.home&&f.away===match.away)||(f.home===match.away&&f.away===match.home)) : [];
-      form.querySelector('[name="fixtureId"]').innerHTML='<option value="">Velg riktig kamp og dato</option>'+fixtures.slice().sort((a,b)=>a.date.localeCompare(b.date)||a.time.localeCompare(b.time)).map(f=>`<option value="${e(f.id)}">${e(formatDate(f.date))} ${e(f.time)} · ${e(getTeam(f.home)?.name)} – ${e(getTeam(f.away)?.name)} · ${e(f.venue)}</option>`).join('');
-      return;
-    }
     if(event.target.id==='admin-fixture-select') {
       const f=(state.fixtures||[]).find(x=>x.id===event.target.value);
       const form=document.getElementById('match-form');
@@ -1066,7 +997,7 @@
       form.querySelector('[name="home"]').value=f.home;
       form.querySelector('[name="away"]').value=f.away;
       form.querySelector('[name="date"]').value=f.date;
-      form.querySelector('[name="label"]').value=(f.round ? 'Runde '+f.round : 'Ligakamp')+' · '+f.venue;
+      form.querySelector('[name="label"]').value='Runde '+f.round+' · '+f.venue;
       form.querySelector('[name="homeGoals"]').value=old?.homeGoals??'';
       form.querySelector('[name="awayGoals"]').value=old?.awayGoals??'';
       const alertBox=document.getElementById('match-existing-hint');
@@ -1137,6 +1068,20 @@
       return;
     }
 
+    if (action === 'delete-player') {
+      const form=document.getElementById('player-form');
+      const id=form?.elements.playerId?.value;
+      if(!id){alert('Velg en eksisterende spiller først.');return;}
+      const player=getPlayer(id);
+      if(!player)return;
+      const referenced=state.matches.some(m=>(m.goalEvents||[]).some(g=>g.scorerPlayerId===id||(g.assistPlayerIds||[]).includes(id))||(m.penalties||[]).some(p=>p.playerId===id));
+      if(referenced){alert('Spilleren har kampstatistikk og kan ikke slettes. Rediger spillerens lag eller navn i stedet.');return;}
+      if(!confirm('Slette '+player.name+' fra spillerlisten?'))return;
+      state.players=state.players.filter(p=>p.id!==id);
+      state.teams.forEach(t=>{if(t.captainId===id)t.captainId=null;});
+      await saveData();route();return;
+    }
+
     if (action === 'export-data') {
       const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
@@ -1149,6 +1094,21 @@
       URL.revokeObjectURL(url);
       return;
     }
+  });
+
+  document.addEventListener('change', event => {
+    if(event.target.id!=='admin-player-select')return;
+    const form=document.getElementById('player-form');
+    const player=getPlayer(event.target.value);
+    if(!form)return;
+    if(!player){form.reset();return;}
+    form.elements.playerId.value=player.id;
+    form.elements.teamId.value=player.teamId;
+    form.elements.number.value=player.number??'';
+    form.elements.name.value=player.name;
+    form.elements.position.value=player.position||'F';
+    form.elements.shutouts.value=player.shutouts||0;
+    form.elements.captain.checked=getTeam(player.teamId)?.captainId===player.id;
   });
 
   document.addEventListener('change', event => {
