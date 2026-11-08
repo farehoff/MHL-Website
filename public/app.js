@@ -7,8 +7,19 @@
   let state = JSON.parse(JSON.stringify(baseData));
   let revision = 0;
   let loggedIn = false;
+  let account = null;
+  let users = [];
+  let auditEntries = [];
+  const canManageLeague=()=>account && ["superadmin","league_admin"].includes(account.role);
+  const canManageMedia=()=>account && ["superadmin","league_admin","editor"].includes(account.role);
+  const canManageRoster=()=>account && ["superadmin","league_admin","team_manager"].includes(account.role);
+  const isSuper=()=>account?.role==="superadmin";
   let saving = false;
   let galleryPhotos = [];
+  let mailingEnabled = false;
+  let newsletterOverview = {subscribers:0,mailings:[]};
+  let viewStats = {total:null,today:null};
+  let visitCountInProgress = false;
   const staticGallery = Array.from({length:5},(_,i)=>({id:'static-'+(i+1),src:'assets/hockey-'+(i+1)+'.jpg',alt:'Hockeymiljøet i MHL'}));
   function shuffledPhotos(items) {
     const out=items.slice();
@@ -45,12 +56,14 @@
     const result = await fetchJSON('/api/state');
     state = result.data;revision = result.revision;
     const session = await fetchJSON('/api/session');
-    setLoggedIn(session.authenticated);
+    setLoggedIn(session.authenticated);account=session.user||null;
     await loadGallery();
+    try { const status=await fetchJSON('/api/newsletter/status');mailingEnabled=!!status.enabled; }catch{mailingEnabled=false;}
+    if (session.authenticated && canManageMedia()) {try{newsletterOverview=await fetchJSON('/api/newsletter/overview');}catch{}}
     route();
   }
   async function saveData() {
-    if(saving){ alert('En lagring pågår. Forsøk igjen om et øyeblikk.');return; }
+    if(saving){ alert('En lagring pågår. Forsøk igjen om et øyeblikk.');return false; }
     saving=true;
     try {
       const response = await fetchJSON('/api/state', {
@@ -58,9 +71,11 @@
         body:JSON.stringify({revision,data:state})
       });
       revision = response.revision;
+      return true;
     } catch(err) {
       alert('Lagring mislyktes: '+err.message+' — siden oppdateres fra databasen.');
       try { await loadRemoteData(); } catch (_) {}
+      return false;
     } finally { saving=false; }
   }
   async function resetData() {
@@ -117,22 +132,99 @@
     return `<span class="mini-badge" style="${teamStyle(team)}">${e(team.initials || team.short || team.name.slice(0, 3))}</span>`;
   }
 
-  function ensurePlayer(teamId, number) {
-    const normalized = Number(number);
-    if (!teamId || !Number.isFinite(normalized)) return null;
-    const existing = state.players.find(player => player.teamId === teamId && player.number != null && Number(player.number) === normalized);
-    if (existing) return existing.id;
-    const team = getTeam(teamId);
-    const id = `${teamId}-${normalized}-${Date.now().toString(36)}`;
-    state.players.push({
-      id,
-      teamId,
-      number: normalized,
-      name: `${team ? team.name : 'Spiller'} #${normalized}`,
-      position: 'F',
-      shutouts: 0
-    });
+  // Stable player IDs are the only identity used in goals, assists and penalties.
+  // Numbers are team-scoped aliases, not identifiers.
+  function playerNumbers(player) {
+    const numbers = [player.number, ...(Array.isArray(player.otherNumbers) ? player.otherNumbers : [])];
+    return [...new Set(numbers.filter(n => n !== null && n !== undefined && n !== '' && Number.isInteger(Number(n)) && Number(n) >= 0).map(Number))];
+  }
+  function matchingPlayers(teamId, number) {
+    const n = Number(number);
+    return state.players.filter(p => p.teamId === teamId && playerNumbers(p).includes(n));
+  }
+  function numberLabel(player) {
+    const primary = player.number == null ? 'uten nummer' : '#' + player.number;
+    const aliases = playerNumbers(player).filter(n => n !== Number(player.number));
+    return primary + (aliases.length ? ' · også ' + aliases.map(n => '#'+n).join(', ') : '');
+  }
+  function playerSelectOptions(teamId, selected='') {
+    return `<option value="">Automatisk via draktnummer</option>` + state.players
+      .filter(p => !teamId || p.teamId === teamId)
+      .slice().sort((a,b) => a.name.localeCompare(b.name, 'nb'))
+      .map(p => `<option value="${e(p.id)}" ${p.id===selected?'selected':''}>${e(p.name)} (${e(numberLabel(p))})</option>`).join('');
+  }
+  function parseOtherNumbers(input) {
+    if (!String(input||'').trim()) return [];
+    const parts=String(input).split(/[,;\s]+/).filter(Boolean);
+    const numbers=parts.map(x=>Number(x));
+    if(numbers.some(n=>!Number.isInteger(n)||n<0||n>999))throw Error('Andre draktnumre må være heltall fra 0 til 999, skilt med komma.');
+    return [...new Set(numbers)];
+  }
+  function checkNumbersConflict(teamId, playerId, numbers) {
+    return state.players.find(p=>p.id!==playerId&&p.teamId===teamId&&numbers.some(n=>playerNumbers(p).includes(n)));
+  }
+  function normalizeMatchTime(value) {
+    const match=String(value||'').trim().match(/^(\d{1,2})[:.](\d{1,2})$/);
+    if(!match||Number(match[2])>59)throw Error('Tid må være MM:SS (f.eks. 05:27). Punktum godtas også.');
+    return match[1].padStart(2,'0')+':'+match[2].padStart(2,'0');
+  }
+  function ensurePlayer(teamId, number, selectedId='') {
+    const n = Number(number);
+    if(!getTeam(teamId)||!Number.isInteger(n)||n<0||n>999)throw Error('Ugyldig lag eller draktnummer.');
+    const candidates=matchingPlayers(teamId,n);
+    if(selectedId){
+      const chosen=getPlayer(selectedId);
+      if(!chosen||chosen.teamId!==teamId)throw Error('Valgt spiller tilhører ikke laget.');
+      if(!playerNumbers(chosen).includes(n) && candidates.length===0){
+        chosen.otherNumbers=[...new Set([...(chosen.otherNumbers||[]),n])].filter(x=>x!==chosen.number);
+      }
+      // If two players used this number historically, the explicit choice
+      // resolves THIS event without incorrectly assigning the number forever.
+      return chosen.id;
+    }
+    if(candidates.length===1)return candidates[0].id;
+    if(candidates.length>1)throw Error(`Draktnummer #${n} finnes på flere spillerprofiler hos ${getTeam(teamId).name}. Velg riktig spiller ved navn, eller slå sammen duplikatene.`);
+    const team=getTeam(teamId);
+    const id='player-'+crypto.randomUUID();
+    state.players.push({id,teamId,number:n,otherNumbers:[],name:`${team.name} #${n}`,position:'F',shutouts:0});
     return id;
+  }
+  function mergePlayerRecords(sourceId,targetId) {
+    if(sourceId===targetId)throw Error('Du må velge to forskjellige spilleroppføringer.');
+    const source=getPlayer(sourceId), target=getPlayer(targetId);
+    if(!source||!target||source.teamId!==target.teamId)throw Error('Du kan bare slå sammen spillerprofiler på samme lag.');
+    const numbers=[...new Set([...playerNumbers(target),...playerNumbers(source)])];
+    const conflict=checkNumbersConflict(target.teamId,sourceId,numbers.filter(n=>!playerNumbers(target).includes(n)));
+    if(conflict&&conflict.id!==target.id)throw Error('Nummerkonflikt med '+conflict.name+'. Rydd opp i disse duplikatene først.');
+    target.otherNumbers=numbers.filter(n=>n!==Number(target.number));
+    target.shutouts=Math.max(Number(target.shutouts||0),Number(source.shutouts||0)); // do not double-count manually entered shutouts
+    for(const m of state.matches){
+      for(const g of (m.goalEvents||[])){
+        if(g.scorerPlayerId===sourceId)g.scorerPlayerId=targetId;
+        g.assistPlayerIds=[...new Set((g.assistPlayerIds||[]).map(id=>id===sourceId?targetId:id))];
+      }
+      for(const x of (m.penalties||[]))if(x.playerId===sourceId)x.playerId=targetId;
+    }
+    state.teams.forEach(t=>{if(t.captainId===sourceId)t.captainId=targetId;});
+    state.players=state.players.filter(p=>p.id!==sourceId);
+  }
+  async function trackHomepageView(){
+    if(visitCountInProgress)return;
+    visitCountInProgress=true;
+    try{
+      const day=new Date().toLocaleDateString('en-CA',{timeZone:'Europe/Oslo'});
+      const key='mhl-visit-'+day;
+      let token=sessionStorage.getItem(key);
+      if(!token){token=crypto.randomUUID();sessionStorage.setItem(key,token);}
+      const result=await fetchJSON('/api/views',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({page:'home',token})});
+      viewStats={total:result.total,today:result.today};
+      updateViewCounter();
+    }catch(err){console.warn('Besøksteller utilgjengelig',err);}
+    finally{visitCountInProgress=false;}
+  }
+  function updateViewCounter(){
+    const span=document.getElementById('mhl-view-counter');
+    if(span&&viewStats.total!=null){span.textContent=Number(viewStats.total).toLocaleString('nb-NO')+' besøk registrert · '+Number(viewStats.today).toLocaleString('nb-NO')+' i dag';}
   }
 
   function summarize() {
@@ -270,19 +362,46 @@
     `;
   }
 
+  function postPhotos(post) {
+    return (post.photoIds||[]).slice(0,3).map(id=> {
+      const photo=galleryPhotos.find(p=>p.id===id);
+      return photo&&photo.active?`<img src="${e(photo.src)}" alt="${e(photo.alt)}" loading="lazy">`:'';
+    }).filter(Boolean).join('');
+  }
+  function postRoundup(post){
+    const snap=post.roundup;
+    if(!snap) return '';
+    return `<div class="post-roundup"><strong>Tabellen ved publisering</strong><div class="post-roundup-table">${(snap.standings||[]).map((r,i)=>`<div><b>${i+1}.</b><span>${e(r.team)}</span><small>${r.gp} K · ${r.movement===null||r.movement===undefined?'–':r.movement>0?'↑'+r.movement:r.movement<0?'↓'+Math.abs(r.movement):'→'}</small><b>${r.pts} P</b></div>`).join('')}</div><strong>Poengplukkerne</strong><p>${(snap.leaders||[]).map((r,i)=>`${i+1}. ${e(r.name)} (${e(r.team)}) – ${r.points} p`).join(' · ')}</p><small>Øyeblikksbilde fra publiseringstidspunktet.</small></div>`;
+  }
   function postsMarkup(posts) {
     if (!posts.length) return `<div class="empty">Ingen publiseringer registrert ennå.</div>`;
     return `<div class="posts-feed">${posts.map(post => `
       <article class="post-card">
         <div class="post-meta">
-          <span>${post.pinned ? 'Festet innlegg' : 'Publisering'}</span>
+          <span>${post.pinned ? 'Festet innlegg' : (post.kind==='roundup'?'Runden i MHL':'Publisering')}</span>
           <span>${e(formatDate((post.createdAt || '').slice(0, 10)))}</span>
         </div>
         <h3>${e(post.title)}</h3>
-        <p>${e(post.content)}</p>
+        <div class="post-gallery">${postPhotos(post)}</div>
+        <p class="post-copy">${e(post.content)}</p>
+        ${postRoundup(post)}
         <small>Publisert av ${e(post.author || 'MHL')}</small>
       </article>
     `).join('')}</div>`;
+  }
+  function roundupSnapshot(){
+    const summary=summarize();
+    const previous=state.posts.filter(p=>p.kind==='roundup'&&p.roundup?.standings)
+      .sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt)))[0];
+    const old=new Map((previous?.roundup?.standings||[]).map((r,i)=>[r.team,{place:i+1,pts:Number(r.pts)||0}]));
+    return {previousPost:previous?.title||null,
+      standings:summary.standings.map((r,i)=>{const before=old.get(r.team.name);return {team:r.team.name,gp:r.gp,diff:r.gf-r.ga,pts:r.pts,
+        movement:before?before.place-(i+1):null,gained:before?r.pts-before.pts:null};}),
+      leaders:summary.leaders.points.slice(0,3).map(p=>({name:p.name,team:p.team?.name||'',points:p.points}))};
+  }
+  function newsletterMarkup(){
+    return `<div class="newsletter-wrap"><div><span class="eyebrow">MHL rett i innboksen</span><h2>FÅ RUNDEOPPSUMMERINGENE.</h2><p>Få nyheter, rundens spiller og oppdateringer fra hockeyligaen. Gratis, frivillig og enkelt å melde seg av.</p></div>
+    ${mailingEnabled?`<form id="newsletter-form" class="newsletter-form"><label for="newsletter-email">Din e-postadresse</label><input id="newsletter-email" type="email" name="email" required maxlength="254" placeholder="navn@eksempel.no" autocomplete="email"><input name="website" class="newsletter-trap" tabindex="-1" autocomplete="off" aria-hidden="true"><label class="newsletter-consent"><input type="checkbox" name="consent" required> Jeg ønsker MHL-oppdateringer på e-post og godtar at e-postadressen lagres til dette formålet.</label><button class="btn" type="submit">Meld meg på</button><p id="newsletter-feedback" role="status"></p></form>`:`<p class="newsletter-disabled">Påmelding åpner når e-postutsending er konfigurert.</p>`}</div>`;
   }
 
   function standingsTable(standings) {
@@ -566,6 +685,7 @@
         <div class="container">
           ${sectionHead('Nyheter', 'Publiseringer')}
           ${postsMarkup(summary.posts.slice(0, 4))}
+          ${newsletterMarkup()}
         </div>
       </section>
       <section class="section">
@@ -593,6 +713,7 @@
         </div>
       </section>
     `);
+    void trackHomepageView();
   }
 
   function tablePage() {
@@ -682,7 +803,8 @@
     return `
       <div class="repeat-row goal-row">
         <select name="goalTeam" aria-label="Lag">${teamOptions('ozo')}</select>
-        <input name="goalPlayer" type="number" min="0" placeholder="Scorer #" aria-label="Målscorer nummer">
+        <input name="goalPlayer" type="number" min="0" max="999" placeholder="Scorer #" aria-label="Målscorer nummer">
+        <select name="goalIdentity" aria-label="Velg målscorer ved navn ved nytt draktnummer">${playerSelectOptions('ozo')}</select>
         <input name="goalAssists" type="text" placeholder="Assist (f.eks. 15,28)" aria-label="Assistnumre">
         <input name="goalPeriod" type="number" min="1" max="3" value="1" aria-label="Periode">
         <input name="goalTime" type="text" placeholder="MM:SS" aria-label="Tid">
@@ -695,7 +817,8 @@
     return `
       <div class="repeat-row penalty-row">
         <select name="penaltyTeam" aria-label="Lag">${teamOptions('ozo')}</select>
-        <input name="penaltyPlayer" type="number" min="0" placeholder="Spiller #" aria-label="Spiller nummer">
+        <input name="penaltyPlayer" type="number" min="0" max="999" placeholder="Spiller #" aria-label="Spiller nummer">
+        <select name="penaltyIdentity" aria-label="Velg spiller ved navn ved nytt draktnummer">${playerSelectOptions('ozo')}</select>
         <input name="penaltyReason" type="text" placeholder="Årsak" aria-label="Årsak">
         <input name="penaltyMinutes" type="number" min="0" value="2" aria-label="Minutter">
         <input name="penaltyPeriod" type="number" min="1" max="3" value="1" aria-label="Periode">
@@ -705,6 +828,20 @@
     `;
   }
 
+  async function loadUsers(){
+    if(!isSuper())return;
+    try{const [u,a]=await Promise.all([fetchJSON('/api/users'),fetchJSON('/api/audit')]);users=u.users||[];auditEntries=a.entries||[];}catch(err){alert('Kunne ikke lese brukere: '+err.message);}
+    route();
+  }
+  function userAdminMarkup(){
+    return `<article class="panel admin-panel admin-wide"><div class="panel-header"><h3>Brukerkontoer og rettigheter</h3><button type="button" class="ghost-btn" data-action="refresh-users">Oppdater oversikten</button></div>
+    <p class="admin-note">Lag egne kontoer. Brukerne kan deaktiveres og få nye passord. Hver lagleder har kun tilgang til sitt eget lags spillerliste og laginformasjon.</p>
+    <form id="create-user-form" class="stack-form"><div class="field-grid two"><label>Navn<input name="displayName" required maxlength="100" placeholder="Fornavn Etternavn"></label><label>Brukernavn<input name="username" required pattern="[A-Za-z0-9._-]{3,48}" placeholder="f.eks. astor.lagleder"></label></div>
+    <div class="field-grid two"><label>Rolle<select name="role" id="new-user-role"><option value="team_manager">Lagleder</option><option value="league_admin">Ligaadmin</option><option value="editor">Redaktør</option></select></label><label>Lag (for lagleder)<select name="teamId">${state.teams.map(t=>`<option value="${e(t.id)}">${e(t.name)}</option>`).join('')}</select></label></div>
+    <label>Førstegangspassord (min. 14 tegn)<input name="password" type="password" minlength="14" autocomplete="new-password" required></label><button class="btn" type="submit">Opprett bruker</button></form>
+    <div class="admin-list">${users.length?users.map(u=>`<div class="admin-list-item"><div><strong>${e(u.display_name)}</strong><small>${e(u.username)} · ${e({league_admin:'Ligaadmin',team_manager:'Lagleder',editor:'Redaktør',superadmin:'Superadmin'}[u.role]||u.role)} ${u.team_id?'· '+e(getTeam(u.team_id)?.name||u.team_id):''} · ${u.enabled?'Aktiv':'Deaktivert'}</small></div><button class="ghost-btn" data-user-toggle="${e(u.id)}" data-enabled="${u.enabled?0:1}" type="button">${u.enabled?'Deaktiver':'Aktiver'}</button><button class="ghost-btn" data-user-password="${e(u.id)}" type="button">Nytt passord</button></div>`).join(''):'<p class="admin-note">Ingen tilleggskontoer ennå. Trykk «Oppdater oversikten» hvis det er opprettet kontoer.</p>'}</div></article>
+    <article class="panel admin-panel admin-wide"><div class="panel-header"><h3>Endringslogg</h3></div><div class="admin-list">${auditEntries.slice(0,30).map(x=>`<div class="admin-list-item"><div><strong>${e(x.actor_name)} · ${e(x.action)}</strong><small>${e(x.created_at)} · ${e(x.details)}</small></div></div>`).join('')||'<p class="admin-note">Ingen registrerte hendelser.</p>'}</div></article>`;
+  }
   function adminPage() {
     const summary = summarize();
     const loggedIn = isLoggedIn();
@@ -713,18 +850,24 @@
       <section class="section">
         <div class="container admin-grid">
           ${loggedIn ? `
-            ${adminGalleryMarkup()}
-            <article class="panel admin-panel">
+            ${canManageMedia()?`<article class="panel admin-panel admin-wide"><div class="panel-header"><h3>E-postoppdateringer</h3></div><p class="admin-note">${mailingEnabled?'Påmelding og e-postutsending er konfigurert.':'Ikke aktivert: Sett opp Resend-secrets før e-post kan sendes.'} Bekreftede abonnenter: <strong>${newsletterOverview.subscribers||0}</strong>. Utsending er et bevisst valg ved ny publisering.</p><div class="admin-list">${(newsletterOverview.mailings||[]).slice(0,12).map(m=>`<div class="admin-list-item"><span>${e(m.post_id)}</span><small>${e(m.status)} · ${m.recipients} mottakere</small></div>`).join('')}</div></article>`:""}
+            ${canManageMedia()?adminGalleryMarkup():""}
+            ${isSuper()?userAdminMarkup():""}
+            ${canManageMedia()?`<article class="panel admin-panel">
               <div class="panel-header"><h3>Ny publisering</h3></div>
               <form id="post-form" class="stack-form">
                 <label>Tittel<input type="text" name="title" required></label>
                 <label>Forfatter<input type="text" name="author" value="Ligaadmin" required></label>
-                <label>Innhold<textarea name="content" rows="5" required></textarea></label>
+                <label>Innhold<textarea name="content" rows="7" placeholder="Rundens spiller, høydepunkter og andre nyheter …" required></textarea></label>
+                <label>Type innlegg<select name="kind"><option value="news">Nyhet / beskjed</option><option value="roundup">Runden i MHL – med tabell og poengplukkere</option></select></label>
+                <fieldset class="post-image-picker"><legend>Velg inntil tre bilder fra bildebiblioteket</legend><div class="post-image-grid">${galleryPhotos.filter(p=>p.active).map(p=>`<label class="post-image-choice"><input name="postPhoto" type="checkbox" value="${e(p.id)}"><img src="${e(p.src)}" alt="${e(p.alt)}"><span>${e(p.alt)}</span></label>`).join('')||'<p>Last opp og aktiver bilder i bildebiblioteket først.</p>'}</div></fieldset>
                 <label class="checkbox"><input type="checkbox" name="pinned"> Fest innlegget øverst</label>
+                <label class="checkbox"><input type="checkbox" name="sendEmail" ${mailingEnabled?'':'disabled'}> Send også som e-post til påmeldte (kun én gang per innlegg)</label>
+                <p class="form-hint">${mailingEnabled?'E-post sendes etter at innlegget er lagret. Du får status på utsendingen.':'E-post er ikke aktivert. Sett opp Resend først. Innlegget kan likevel publiseres.'}</p>
                 <button class="btn" type="submit">Publiser innlegg</button>
               </form>
-            </article>
-            <article class="panel admin-panel admin-wide">
+            </article>`:""}
+            ${canManageLeague()?`<article class="panel admin-panel admin-wide">
               <div class="panel-header"><h3>Registrer kampstatistikk</h3></div>
               <form id="match-form" class="stack-form">
                 <label>Velg terminfestet kamp (redigerer resultatet om det allerede er registrert)
@@ -752,7 +895,7 @@
                   <button class="ghost-btn" type="button" data-action="add-goal-row">+ Legg til scoring</button>
                 </div>
                 <div id="goal-rows" class="repeat-wrap">${goalRow(0)}</div>
-                <small class="form-hint">Når et draktnummer ikke finnes fra før, opprettes spilleren automatisk på valgt lag.</small>
+                <small class="form-hint">Kjent nummer (inkludert alternative numre) gir automatisk riktig spiller-ID. Ved nytt eller tvetydig nummer: velg spilleren ved navn. Nye numre knyttes til den valgte spilleren.</small>
 
                 <div class="subsection-head">
                   <h4>Utvisninger</h4>
@@ -762,13 +905,15 @@
 
                 <button class="btn" type="submit">Lagre kamp</button>
               </form>
-            </article>
-            <article class="panel admin-panel">
+            </article>`:""}
+            ${canManageRoster()?`<article class="panel admin-panel">
               <div class="panel-header"><h3>Spiller og kaptein</h3></div>
               <form id="player-form" class="stack-form">
-                <label>Handling<select name="playerId" id="admin-player-select"><option value="">+ Opprett ny spiller</option>${state.players.slice().sort((a,b)=>((getTeam(a.teamId)?.name||'').localeCompare(getTeam(b.teamId)?.name||''))||a.name.localeCompare(b.name)).map(p=>`<option value="${e(p.id)}">${e(getTeam(p.teamId)?.name||'Ukjent lag')} · ${e(p.name)}${p.number!=null?' (#'+e(p.number)+')':''}</option>`).join('')}</select></label>
-                <label>Lag<select name="teamId" required>${teamOptions(state.teams[0]?.id)}</select></label>
-                <label>Draktnummer (valgfritt)<input type="number" name="number" min="0" placeholder="Ikke registrert"></label>
+                <label>Handling<select name="playerId" id="admin-player-select"><option value="">+ Opprett ny spiller</option>${state.players.filter(p=>account?.role!=="team_manager"||p.teamId===account.teamId).slice().sort((a,b)=>((getTeam(a.teamId)?.name||'').localeCompare(getTeam(b.teamId)?.name||''))||a.name.localeCompare(b.name)).map(p=>`<option value="${e(p.id)}">${e(getTeam(p.teamId)?.name||'Ukjent lag')} · ${e(p.name)}${p.number!=null?' (#'+e(p.number)+')':''}</option>`).join('')}</select></label>
+                <label>Lag<select name="teamId" required>${account?.role==="team_manager"?`<option value="${e(account.teamId)}">${e(getTeam(account.teamId)?.name)}</option>`:teamOptions(state.teams[0]?.id)}</select></label>
+                <label>Hovednummer (valgfritt)<input type="number" name="number" min="0" max="999" placeholder="Ikke registrert"></label>
+                <label>Andre brukte draktnumre<input type="text" name="otherNumbers" inputmode="numeric" placeholder="Eksempel: 87, 28"></label>
+                <p class="form-hint">Spillerens faste ID endres aldri. Ved endring av hovednummer beholdes det gamle automatisk som alternativt nummer på samme lag.</p>
                 <label>Spillernavn<input type="text" name="name" placeholder="Fornavn Etternavn" required></label>
                 <label>Posisjon<select name="position"><option value="F">Løper</option><option value="D">Back</option><option value="GK">Målvakt</option></select></label>
                 <label>Shutouts (målvakt)<input type="number" name="shutouts" min="0" value="0"></label>
@@ -776,19 +921,27 @@
                 <button class="btn" type="submit">Lagre spiller</button>
                 <button class="ghost-btn" type="button" data-action="delete-player">Slett valgt spiller (kun uten kampstatistikk)</button>
               </form>
-              <p class="admin-note">Velg en eksisterende spiller for å endre lag, nummer eller kapteinstatus uten å opprette en ny. Den faste spiller-ID-en og statistikken beholdes. Bruk «Opprett ny spiller» bare for nye personer.</p>
-            </article>
+              <p class="admin-note">Velg en eksisterende spiller for å endre lag, nummer eller kapteinstatus uten å opprette en ny. Historisk kampstatistikk følger spiller-ID-en.</p>
+            </article>`:""}
+            ${canManageLeague()?`<article class="panel admin-panel admin-wide"><div class="panel-header"><h3>Slå sammen dupliserte spillere</h3></div>
+              <p class="admin-note">Bruk dette kun når du vet at to oppføringer gjelder samme person. Mål, assists og utvisninger flyttes automatisk til profilen som beholdes. Ta gjerne JSON-backup først.</p>
+              <form id="merge-players-form" class="stack-form">
+                <div class="field-grid two"><label>Behold denne spillerprofilen<select name="targetId" required><option value="">Velg spiller</option>${state.players.slice().sort((a,b)=>a.name.localeCompare(b.name,'nb')).map(p=>`<option value="${e(p.id)}">${e(getTeam(p.teamId)?.name)} · ${e(p.name)} · ${e(numberLabel(p))}</option>`).join('')}</select></label>
+                <label>Slå inn denne duplikaten<select name="sourceId" required><option value="">Velg duplikat</option>${state.players.slice().sort((a,b)=>a.name.localeCompare(b.name,'nb')).map(p=>`<option value="${e(p.id)}">${e(getTeam(p.teamId)?.name)} · ${e(p.name)} · ${e(numberLabel(p))}</option>`).join('')}</select></label></div>
+                <button type="submit" class="btn secondary">Slå sammen bekreftede duplikater</button>
+              </form>
+            </article>`:""}
             <article class="panel admin-panel">
-              <div class="panel-header"><h3>Dataverktøy</h3></div>
+              <div class="panel-header"><h3>Din konto</h3></div><p class="admin-note">${e(account?.displayName||account?.username||"")} · ${e(account?.role||"")}</p><div class="panel-header"><h3>Dataverktøy</h3></div>
               <div class="admin-actions">
                 <button class="btn secondary" type="button" data-action="export-data">Eksporter JSON</button>
-                <label class="file-upload">Importer JSON<input type="file" id="import-json" accept="application/json"></label>
+                ${canManageLeague()?`<label class="file-upload">Importer JSON<input type="file" id="import-json" accept="application/json"></label>`:""}
                 
                 <button class="btn secondary" type="button" data-action="logout">Logg ut</button>
               </div>
               <p class="admin-note">Endringer lagres i Cloudflare D1 og blir synlige for alle. Eksporter gjerne sikkerhetskopi før større endringer.</p>
             </article>
-            <article class="panel admin-panel admin-wide">
+            ${canManageMedia()?`<article class="panel admin-panel admin-wide">
               <div class="panel-header"><h3>Publiseringer</h3></div>
               <div class="admin-list">
                 ${summary.posts.map(post => `
@@ -797,11 +950,20 @@
                       <strong>${e(post.title)}</strong>
                       <small>${e(post.author || 'MHL')} · ${e(formatDate((post.createdAt || '').slice(0, 10)))}</small>
                     </div>
+                    <button class="ghost-btn" type="button" data-action="edit-post" data-post-id="${e(post.id)}">Rediger / bilder</button>
                     <button class="ghost-btn" type="button" data-action="delete-post" data-post-id="${e(post.id)}">Slett</button>
                   </div>
                 `).join('')}
               </div>
-            </article>
+              <form id="edit-post-form" class="stack-form" hidden>
+                <h4>Rediger publisering</h4>
+                <input type="hidden" name="postId">
+                <label>Tittel<input type="text" name="title" required></label>
+                <label>Innhold<textarea name="content" rows="6" required></textarea></label>
+                <fieldset class="post-image-picker"><legend>Bilder (maks tre fra R2)</legend><div class="post-image-grid">${galleryPhotos.filter(p=>p.active).map(p=>`<label class="post-image-choice"><input type="checkbox" name="photo" value="${e(p.id)}"><img src="${e(p.src)}" alt="${e(p.alt)}"><span>${e(p.alt)}</span></label>`).join('')||'<p>Last opp bilder i bildebiblioteket først.</p>'}</div></fieldset>
+                <button type="submit" class="btn">Lagre innlegg</button>
+              </form>
+            </article>`:""}
           ` : `
             <article class="panel admin-panel single-column">
               <div class="panel-header"><h3>Logg inn</h3></div>
@@ -821,6 +983,7 @@
   function renderPage(title, html) {
     document.title = `${title} | ${state.leagueName}`;
     footerSeason.textContent = state.season;
+    updateViewCounter();
     app.innerHTML = html;
     document.querySelectorAll('[data-nav]').forEach(link => {
       const segment = (location.hash.replace(/^#\/?/, '').split('/')[0] || '');
@@ -852,33 +1015,75 @@
   document.addEventListener('submit', async event => {
     const form = event.target;
 
+    if(form.id==='newsletter-form'){
+      event.preventDefault();const d=new FormData(form),feedback=document.getElementById('newsletter-feedback');
+      const btn=form.querySelector('button[type="submit"]');btn.disabled=true;
+      try{
+        const result=await fetchJSON('/api/newsletter/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:String(d.get('email')||''),consent:d.get('consent')==='on',website:d.get('website')})});
+        if(feedback)feedback.textContent=result.message||'Sjekk e-posten din.';form.reset();
+      }catch(err){if(feedback)feedback.textContent='Påmelding mislyktes: '+err.message;}
+      finally{btn.disabled=false;}
+      return;
+    }
     if (form.id === 'login-form') {
       event.preventDefault();
       const data = new FormData(form);
       try {
-        await fetchJSON('/api/login', {method:'POST',headers:{'Content-Type':'application/json'},
+        const loginResult=await fetchJSON('/api/login', {method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify({username:String(data.get('username')||'').trim(),password:String(data.get('password')||'')})});
-        setLoggedIn(true);route();
+        setLoggedIn(true);account=loginResult.user;route();if(isSuper())loadUsers();
       } catch(err) { alert('Innlogging mislyktes: '+err.message); }
       return;
+    }
+
+    if(form.id==='create-user-form'){
+      event.preventDefault();const d=new FormData(form);
+      try{await fetchJSON('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({displayName:d.get('displayName'),username:d.get('username'),password:d.get('password'),role:d.get('role'),teamId:d.get('teamId')})});form.reset();await loadUsers();alert('Brukerkonto opprettet. Del brukernavn og førstegangspassord sikkert med vedkommende.');}
+      catch(err){alert('Kunne ikke opprette bruker: '+err.message);}return;
     }
 
     if (form.id === 'post-form') {
       event.preventDefault();
       const data = new FormData(form);
-      state.posts.unshift({
+      const photoIds=data.getAll('postPhoto').map(String);
+      if(photoIds.length>3){alert('Du kan velge maksimalt tre bilder.');return;}
+      const post={
         id: `post-${Date.now().toString(36)}`,
         title: String(data.get('title') || '').trim(),
         author: String(data.get('author') || '').trim(),
         content: String(data.get('content') || '').trim(),
+        kind:String(data.get('kind')||'news'),
+        photoIds,
+        roundup:data.get('kind')==='roundup'?roundupSnapshot():null,
         pinned: data.get('pinned') === 'on',
         createdAt: new Date().toISOString()
-      });
-      await saveData();
+      };
+      state.posts.unshift(post);
+      const saved=await saveData();
+      if(!saved)return;
+      if(data.get('sendEmail')==='on'){
+        try{
+          const sent=await fetchJSON('/api/newsletter/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({postId:post.id})});
+          alert(sent.message||'E-postutsending registrert.');
+          newsletterOverview=await fetchJSON('/api/newsletter/overview');
+        }catch(err){alert('Innlegget er publisert, men e-post ble ikke sendt eller må kontrolleres: '+err.message);}
+      }
       route();
       return;
     }
 
+    if(form.id==='edit-post-form'){
+      event.preventDefault();
+      const data=new FormData(form),post=state.posts.find(p=>p.id===data.get('postId'));
+      if(!post){alert('Innlegget finnes ikke lenger.');return;}
+      const ids=data.getAll('photo').map(String);
+      if(ids.length>3){alert('Velg maksimalt tre bilder.');return;}
+      post.title=String(data.get('title')||'').trim();
+      post.content=String(data.get('content')||'').trim();
+      post.photoIds=ids;
+      if(await saveData()){alert('Innlegget er oppdatert uten ny e-postutsending.');route();}
+      return;
+    }
     if (form.id === 'player-form') {
       event.preventDefault();
       const data = new FormData(form);
@@ -892,26 +1097,49 @@
       }
       const normalized = n => n.normalize('NFKC').trim().replace(/\s+/g,' ').toLocaleLowerCase('nb');
       const nameCollision=state.players.find(p=>p.id!==selectedId && p.teamId===teamId && normalized(p.name)===normalized(name));
-      if (nameCollision) {alert('Det finnes allerede en spiller med dette navnet på laget. Velg spilleren i listen for å redigere.');return;}
-      const numberCollision = number !== null && state.players.find(p=>p.id!==selectedId && p.teamId===teamId && p.number!=null && Number(p.number)===number);
-      if(numberCollision) {alert('Draktnummeret brukes allerede på dette laget av '+numberCollision.name+'. Kontroller nummeret eller rediger riktig spiller.');return;}
+      const originalPlayer=selectedId?getPlayer(selectedId):null;
+      if (nameCollision && (!originalPlayer || normalized(originalPlayer.name)!==normalized(name))) {alert('Det finnes allerede en spiller med dette navnet på laget. Velg spilleren i listen for å redigere eller slå sammen duplikatene.');return;}
+      let otherNumbers;
+      try{otherNumbers=parseOtherNumbers(data.get('otherNumbers'));}
+      catch(err){alert(err.message);return;}
+      const existing=selectedId?getPlayer(selectedId):null;
+      if(selectedId&&!existing){alert('Spilleren finnes ikke lenger.');return;}
+      if(existing&&existing.teamId===teamId&&existing.number!=null&&existing.number!==number){
+        otherNumbers.push(Number(existing.number)); // preserve jersey history when changing number
+      }
+      otherNumbers=[...new Set(otherNumbers)].filter(n=>n!==number);
+      const collision=checkNumbersConflict(teamId,selectedId,[...otherNumbers,...(number===null?[]:[number])]);
+      if(collision){alert('Et av numrene brukes også av '+collision.name+' på samme lag. Slå sammen bekreftede duplikater, eller fjern nummerkonflikten.');return;}
       let player;
-      if (selectedId) {
-        player=getPlayer(selectedId);
-        if(!player){alert('Spilleren finnes ikke lenger. Last inn siden på nytt.');return;}
+      if(selectedId){
+        player=existing;
         const formerTeam=getTeam(player.teamId);
-        if(formerTeam?.captainId===player.id && (player.teamId!==teamId || data.get('captain')!=='on')) formerTeam.captainId=null;
-      } else {
-        player={id:'player-'+crypto.randomUUID(),teamId,name,number,position:'F',shutouts:0};
+        if(formerTeam?.captainId===player.id&&(player.teamId!==teamId||data.get('captain')!=='on'))formerTeam.captainId=null;
+      }else{
+        player={id:'player-'+crypto.randomUUID(),teamId,name,number,otherNumbers:[],position:'F',shutouts:0};
         state.players.push(player);
       }
       player.teamId=teamId;
       player.name=name;
       player.number=number;
+      player.otherNumbers=otherNumbers;
       player.position=String(data.get('position')||'F');
       player.shutouts=Number(data.get('shutouts')||0);
-      if(data.get('captain')==='on') getTeam(teamId).captainId=player.id;
+      if(data.get('captain')==='on')getTeam(teamId).captainId=player.id;
       await saveData();route();return;
+    }
+
+    if(form.id==='merge-players-form'){
+      event.preventDefault();
+      const data=new FormData(form),targetId=String(data.get('targetId')||''),sourceId=String(data.get('sourceId')||'');
+      const target=getPlayer(targetId),source=getPlayer(sourceId);
+      if(!target||!source||source===target||source.teamId!==target.teamId){alert('Velg to forskjellige profiler på samme lag.');return;}
+      const stats=summarize().players.find(p=>p.id===sourceId);
+      const message=`Behold ${target.name} (${numberLabel(target)}) og slå inn ${source.name} (${numberLabel(source)})?\n\nDu flytter ${stats?.goals||0} mål, ${stats?.assists||0} assists og ${stats?.pim||0} utvisningsminutter fra duplikaten. Dette kan ikke angres uten backup.`;
+      if(!confirm(message))return;
+      try{mergePlayerRecords(sourceId,targetId);if(await saveData()){alert('Spillerprofilene er slått sammen. Kampstatistikken er bevart.');route();}}
+      catch(err){alert('Kunne ikke slå sammen: '+err.message);}
+      return;
     }
 
     if (form.id === 'match-form') {
@@ -927,44 +1155,38 @@
         return;
       }
 
-      const goalEvents = [];
-      form.querySelectorAll('.goal-row').forEach(row => {
-        const teamId = row.querySelector('[name="goalTeam"]').value;
-        const scorerNumber = row.querySelector('[name="goalPlayer"]').value;
-        const time = row.querySelector('[name="goalTime"]').value.trim();
-        if (!teamId || !scorerNumber || !time) return;
-        const scorerPlayerId = ensurePlayer(teamId, scorerNumber);
-        const assists = row.querySelector('[name="goalAssists"]').value
-          .split(',')
-          .map(item => item.trim())
-          .filter(Boolean)
-          .map(number => ensurePlayer(teamId, number))
-          .filter(Boolean);
-        goalEvents.push({
-          teamId,
-          period: Number(row.querySelector('[name="goalPeriod"]').value || 1),
-          time,
-          scorerPlayerId,
-          assistPlayerIds: assists
-        });
-      });
-
-      const penalties = [];
-      form.querySelectorAll('.penalty-row').forEach(row => {
-        const teamId = row.querySelector('[name="penaltyTeam"]').value;
-        const playerNumber = row.querySelector('[name="penaltyPlayer"]').value;
-        const reason = row.querySelector('[name="penaltyReason"]').value.trim();
-        const time = row.querySelector('[name="penaltyTime"]').value.trim();
-        if (!teamId || !playerNumber || !reason || !time) return;
-        penalties.push({
-          teamId,
-          playerId: ensurePlayer(teamId, playerNumber),
-          period: Number(row.querySelector('[name="penaltyPeriod"]').value || 1),
-          time,
-          reason,
-          minutes: Number(row.querySelector('[name="penaltyMinutes"]').value || 2)
-        });
-      });
+      const goalEvents=[];
+      const penalties=[];
+      const playersBefore=clone(state.players);
+      try{
+        for(const row of form.querySelectorAll('.goal-row')){
+          const teamId=row.querySelector('[name="goalTeam"]').value;
+          const scorerNumber=String(row.querySelector('[name="goalPlayer"]').value||'').trim();
+          const rawTime=row.querySelector('[name="goalTime"]').value.trim();
+          const assistsText=row.querySelector('[name="goalAssists"]').value.trim();
+          if(!scorerNumber&&!rawTime&&!assistsText)continue;
+          if(teamId!==home&&teamId!==away)throw Error('Scoringens lag må være ett av kampens to lag.');
+          if(!scorerNumber||!rawTime)throw Error('En scoringsrad mangler draktnummer eller tidspunkt.');
+          const time=normalizeMatchTime(rawTime);
+          const scorerPlayerId=ensurePlayer(teamId,scorerNumber,row.querySelector('[name="goalIdentity"]').value);
+          const assists=assistsText.split(',').map(x=>x.trim()).filter(Boolean).map(n=>ensurePlayer(teamId,n));
+          if(assists.includes(scorerPlayerId))throw Error('Målscoreren kan ikke også få assist på samme scoring.');
+          goalEvents.push({teamId,period:Number(row.querySelector('[name="goalPeriod"]').value||1),time,scorerPlayerId,assistPlayerIds:[...new Set(assists)]});
+        }
+        for(const row of form.querySelectorAll('.penalty-row')){
+          const teamId=row.querySelector('[name="penaltyTeam"]').value;
+          const playerNumber=String(row.querySelector('[name="penaltyPlayer"]').value||'').trim();
+          const reason=row.querySelector('[name="penaltyReason"]').value.trim();
+          const rawTime=row.querySelector('[name="penaltyTime"]').value.trim();
+          if(!playerNumber&&!reason&&!rawTime)continue;
+          if(teamId!==home&&teamId!==away)throw Error('Utvisningens lag må være ett av kampens to lag.');
+          if(!playerNumber||!reason||!rawTime)throw Error('En utvisningsrad mangler nummer, årsak eller tidspunkt.');
+          penalties.push({teamId,playerId:ensurePlayer(teamId,playerNumber,row.querySelector('[name="penaltyIdentity"]').value),period:Number(row.querySelector('[name="penaltyPeriod"]').value||1),time:normalizeMatchTime(rawTime),reason,minutes:Number(row.querySelector('[name="penaltyMinutes"]').value||2)});
+        }
+      }catch(err){
+        state.players=playersBefore;
+        alert('Kampen ble ikke lagret: '+err.message);return;
+      }
 
       const old=fixtureMatch(fixtureId);
       const updated={
@@ -1000,8 +1222,20 @@
       form.querySelector('[name="label"]').value='Runde '+f.round+' · '+f.venue;
       form.querySelector('[name="homeGoals"]').value=old?.homeGoals??'';
       form.querySelector('[name="awayGoals"]').value=old?.awayGoals??'';
+      for(const row of form.querySelectorAll('.goal-row,.penalty-row')){
+        const team=row.querySelector('[name="goalTeam"], [name="penaltyTeam"]');
+        team.value=f.home;
+        const picker=row.querySelector('[name="goalIdentity"], [name="penaltyIdentity"]');
+        picker.innerHTML=playerSelectOptions(f.home);
+      }
       const alertBox=document.getElementById('match-existing-hint');
       if(alertBox)alertBox.textContent=old?'Eksisterende kamp: Lagre for å oppdatere (ikke opprette en duplikat). Tidligere hendelser beholdes dersom du ikke legger inn nye.':'Ny terminfestet kamp: Resultatet vil vises i tabell og terminliste.';
+      return;
+    }
+    if(event.target.matches('.goal-row [name="goalTeam"], .penalty-row [name="penaltyTeam"]')){
+      const row=event.target.closest('.repeat-row');
+      const picker=row.querySelector('[name="goalIdentity"], [name="penaltyIdentity"]');
+      if(picker)picker.innerHTML=playerSelectOptions(event.target.value);
       return;
     }
     if(event.target.id!=='fixture-filter') return;
@@ -1030,15 +1264,24 @@
     if (!button) return;
     const action = button.dataset.action;
 
+    if(action==='refresh-users'){await loadUsers();return;}
     if (action === 'add-goal-row') {
       const wrap = document.getElementById('goal-rows');
-      if (wrap) wrap.insertAdjacentHTML('beforeend', goalRow(wrap.children.length));
+      if (wrap){
+        wrap.insertAdjacentHTML('beforeend', goalRow(wrap.children.length));
+        const row=wrap.lastElementChild, fixture=(state.fixtures||[]).find(f=>f.id===document.getElementById('admin-fixture-select')?.value);
+        if(fixture){row.querySelector('[name="goalTeam"]').value=fixture.home;row.querySelector('[name="goalIdentity"]').innerHTML=playerSelectOptions(fixture.home);}
+      }
       return;
     }
 
     if (action === 'add-penalty-row') {
       const wrap = document.getElementById('penalty-rows');
-      if (wrap) wrap.insertAdjacentHTML('beforeend', penaltyRow(wrap.children.length));
+      if (wrap){
+        wrap.insertAdjacentHTML('beforeend', penaltyRow(wrap.children.length));
+        const row=wrap.lastElementChild, fixture=(state.fixtures||[]).find(f=>f.id===document.getElementById('admin-fixture-select')?.value);
+        if(fixture){row.querySelector('[name="penaltyTeam"]').value=fixture.home;row.querySelector('[name="penaltyIdentity"]').innerHTML=playerSelectOptions(fixture.home);}
+      }
       return;
     }
 
@@ -1050,9 +1293,20 @@
 
     if (action === 'logout') {
       try { await fetchJSON('/api/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); } catch(err) { alert(err.message); }
-      setLoggedIn(false);route();return;
+      setLoggedIn(false);account=null;route();return;
     }
 
+    if(action==='edit-post'){
+      const post=state.posts.find(p=>p.id===button.dataset.postId);
+      const form=document.getElementById('edit-post-form');if(!post||!form)return;
+      form.hidden=false;
+      form.elements.postId.value=post.id;
+      form.elements.title.value=post.title||'';
+      form.elements.content.value=post.content||'';
+      form.querySelectorAll('[name="photo"]').forEach(el=>{el.checked=(post.photoIds||[]).includes(el.value);});
+      form.scrollIntoView({behavior:'smooth',block:'start'});
+      return;
+    }
     if (action === 'delete-post') {
       const id = button.dataset.postId;
       state.posts = state.posts.filter(post => post.id !== id);
@@ -1105,6 +1359,7 @@
     form.elements.playerId.value=player.id;
     form.elements.teamId.value=player.teamId;
     form.elements.number.value=player.number??'';
+    form.elements.otherNumbers.value=(player.otherNumbers||[]).join(', ');
     form.elements.name.value=player.name;
     form.elements.position.value=player.position||'F';
     form.elements.shutouts.value=player.shutouts||0;
@@ -1130,6 +1385,15 @@
     }
   });
 
+  document.addEventListener('click',async event=>{
+    const toggle=event.target.closest('[data-user-toggle]'),pwd=event.target.closest('[data-user-password]');if(!toggle&&!pwd)return;
+    try{
+      const id=toggle?.dataset.userToggle||pwd.dataset.userPassword;
+      if(toggle){const enabled=toggle.dataset.enabled==='1';if(!confirm(`${enabled?'Aktivere':'Deaktivere'} brukeren?`))return;await fetchJSON('/api/users/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});}
+      else {const password=prompt('Nytt passord (minst 14 tegn). Merk: Ikke send passord i chat eller e-post.');if(password===null)return;if(password.length<14)return alert('Passordet må ha minst 14 tegn.');await fetchJSON('/api/users/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});}
+      await loadUsers();
+    }catch(err){alert(err.message);}
+  });
   document.addEventListener('submit',async event=>{
     if(event.target.id!=='photo-form')return;
     event.preventDefault();
