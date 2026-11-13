@@ -751,14 +751,14 @@
   }
 
   function fixturesPage() {
-    const fixtures=(state.fixtures||[]).slice().sort((a,b)=>a.date.localeCompare(b.date)||a.time.localeCompare(b.time));
+    const fixtures=sortedFixtures();
     const dates=[...new Set(fixtures.map(f=>f.date))];
     const completed = fixtures.filter(f => !!fixtureMatch(f.id)).length;
     renderPage('Terminliste', `
       ${pageBanner('Sesong 2026 / 2027', 'Terminliste & resultater', 'Terminliste og kampresultater på ett sted. Resultater registrert i admin oppdaterer automatisk poengtabell og terminliste.')}
       <section class="section"><div class="container">
         <div class="fixture-toolbar"><div><div class="eyebrow">Sesongen</div><h2>${fixtures.length} KAMPER · ${completed} MED RESULTAT</h2></div><label class="fixture-filter-label">Vis lag <select id="fixture-filter"><option value="">Alle lag</option>${state.teams.map(t=>`<option value="${e(t.id)}">${e(t.name)}</option>`).join('')}</select></label></div>
-        <div id="fixture-list">${dates.map(date=>{const day=fixtures.filter(f=>f.date===date);return `<section class="fixture-day" data-date="${e(date)}"><div class="fixture-day-head"><strong>${e(new Date(date+'T12:00:00').toLocaleDateString('nb-NO',{weekday:'long',day:'numeric',month:'long',year:'numeric'}))}</strong><span>${day.length} kamper</span></div><div class="fixture-day-matches">${day.map(f=>{const m=fixtureMatch(f.id);return `<article class="fixture-match" data-home="${e(f.home)}" data-away="${e(f.away)}"><span class="fixture-time">${e(f.time)}</span><div class="fixture-opponents"><a href="#/team/${e(f.home)}">${e(getTeam(f.home)?.short||f.home)}</a><span class="fixture-versus">${m ? `${e(m.homeGoals)} – ${e(m.awayGoals)}` : 'VS'}</span><a href="#/team/${e(f.away)}">${e(getTeam(f.away)?.short||f.away)}</a></div><div class="fixture-venue"><span>⌖</span> ${e(f.venue)}</div>${m ? `<a class="fixture-result-link" href="#/match/${e(m.id)}">Kamprapport ↗</a>` : `<span class="fixture-upcoming">Ikke spilt / resultat mangler</span>`}</article>`}).join('')}</div></section>`}).join('')}</div>
+        <div id="fixture-list">${dates.map(date=>{const day=fixtures.filter(f=>f.date===date);return `<section class="fixture-day" data-date="${e(date)}"><div class="fixture-day-head"><strong>${e(new Date(date+'T12:00:00').toLocaleDateString('nb-NO',{weekday:'long',day:'numeric',month:'long',year:'numeric'}))}</strong><span>${day.length} kamper</span></div><div class="fixture-day-matches">${day.map(f=>{const m=fixtureMatch(f.id);return `<article class="fixture-match" data-home="${e(f.home)}" data-away="${e(f.away)}"><span class="fixture-time">${f.timeConfirmed===false?'Tid kommer':e(f.time||'Tid kommer')}</span><div class="fixture-opponents"><a href="#/team/${e(f.home)}">${e(getTeam(f.home)?.short||f.home)}</a><span class="fixture-versus">${m ? `${e(m.homeGoals)} – ${e(m.awayGoals)}` : 'VS'}</span><a href="#/team/${e(f.away)}">${e(getTeam(f.away)?.short||f.away)}</a></div><div class="fixture-venue"><span>⌖</span> ${e(f.venue)}${f.rescheduledFrom?.date ? `<span class="fixture-rescheduled" title="Opprinnelig tidspunkt: ${e(formatDate(f.rescheduledFrom.date))} ${e(f.rescheduledFrom.time||'')}">↻ Omberammet fra ${e(formatDate(f.rescheduledFrom.date))}</span>` : ''}</div>${m ? `<a class="fixture-result-link" href="#/match/${e(m.id)}">Kamprapport ↗</a>` : `<span class="fixture-upcoming">Ikke spilt / resultat mangler</span>`}</article>`}).join('')}</div></section>`}).join('')}</div>
         <p class="fixture-note">Resultat vises når en terminfestet kamp er registrert i admin. Historiske kampdata uten sikker kobling til terminlisten er beholdt som egne kamper, for å unngå å gjette hvilken kamp de tilhører.</p>
       </div></section>
     `);
@@ -842,6 +842,68 @@
     <div class="admin-list">${users.length?users.map(u=>`<div class="admin-list-item"><div><strong>${e(u.display_name)}</strong><small>${e(u.username)} · ${e({league_admin:'Ligaadmin',team_manager:'Lagleder',editor:'Redaktør',superadmin:'Superadmin'}[u.role]||u.role)} ${u.team_id?'· '+e(getTeam(u.team_id)?.name||u.team_id):''} · ${u.enabled?'Aktiv':'Deaktivert'}</small></div><button class="ghost-btn" data-user-toggle="${e(u.id)}" data-enabled="${u.enabled?0:1}" type="button">${u.enabled?'Deaktiver':'Aktiver'}</button><button class="ghost-btn" data-user-password="${e(u.id)}" type="button">Nytt passord</button></div>`).join(''):'<p class="admin-note">Ingen tilleggskontoer ennå. Trykk «Oppdater oversikten» hvis det er opprettet kontoer.</p>'}</div></article>
     <article class="panel admin-panel admin-wide"><div class="panel-header"><h3>Endringslogg</h3></div><div class="admin-list">${auditEntries.slice(0,30).map(x=>`<div class="admin-list-item"><div><strong>${e(x.actor_name)} · ${e(x.action)}</strong><small>${e(x.created_at)} · ${e(x.details)}</small></div></div>`).join('')||'<p class="admin-note">Ingen registrerte hendelser.</p>'}</div></article>`;
   }
+
+  // Fixtures keep stable IDs when rescheduled. Results/goal events are tied to fixtureId.
+  function rescheduleFixture(original, changes) {
+    const next = { ...original, ...changes };
+    const changed = original.date !== next.date || original.time !== next.time || original.venue !== next.venue;
+    if(changed && !original.rescheduledFrom?.date) {
+      next.rescheduledFrom = {date:original.date,time:original.time,venue:original.venue};
+    }
+    // Moving back to the originally announced details clears the rescheduled label.
+    if(next.rescheduledFrom?.date && next.date === next.rescheduledFrom.date && next.time === next.rescheduledFrom.time && next.venue === next.rescheduledFrom.venue) {
+      delete next.rescheduledFrom;
+    }
+    state.fixtures = state.fixtures.map(f=>f.id===original.id?next:f);
+    state.matches = state.matches.map(m=> {
+      if(m.fixtureId!==original.id) return m;
+      return {...m,date:next.date,label:/^Runde \d+(?:\s*[·.-].*)?$/i.test(m.label||'')?`Runde ${next.round} · ${next.venue}`:m.label};
+    });
+    return next;
+  }
+  function sortedFixtures() {
+    return (state.fixtures||[]).slice().sort((a,b)=>String(a.date).localeCompare(String(b.date))||String(a.time||'').localeCompare(String(b.time||'')));
+  }
+  function fixtureSummary(f) {
+    return `${formatDate(f.date)} ${f.timeConfirmed===false?'Tid ikke bekreftet':(f.time||'Tid ikke bekreftet')} · ${getTeam(f.home)?.short||f.home} – ${getTeam(f.away)?.short||f.away} · ${f.venue}`;
+  }
+  function fixtureAdminMarkup() {
+    // Restrict the suggested bulk move to the Fosen round. Other Nov 7 games were played at Dalgård.
+    const fosenRound = sortedFixtures().filter(f=>f.date==='2026-11-07' &&
+      (/fosen/i.test(f.venue||'') || (['astor','fosen','dogs-k9'].includes(f.home)&&['astor','fosen','dogs-k9'].includes(f.away))));
+    return `<article class="panel admin-panel admin-wide" id="fixture-editor-panel">
+      <div class="panel-header"><h3>Administrer terminliste</h3><span class="fixture-admin-chip">Flytt · rediger · opprett</span></div>
+      <p class="admin-note">Rediger eksisterende kamp uten å lage en duplikat. Kamp-ID, resultat og spillerstatistikk beholdes. Oppdatert dato/arena vises umiddelbart på terminlisten.</p>
+      <form id="fixture-edit-form" class="stack-form">
+        <label>Velg kamp<select name="fixtureId" id="fixture-edit-select" required><option value="">Velg fra terminlisten …</option>
+          ${sortedFixtures().map(f=>`<option value="${e(f.id)}">${e(fixtureSummary(f))}${fixtureMatch(f.id)?' · RESULTAT REGISTRERT':''}</option>`).join('')}
+        </select></label>
+        <div id="fixture-edit-preview" class="form-hint" aria-live="polite">Velg en kamp for å endre dato, tid eller arena.</div>
+        <div class="field-grid two"><label>Ny dato<input type="date" name="date" required></label><label>Klokkeslett (kan stå tomt)<input type="time" name="time"></label></div>
+        <label class="checkbox"><input type="checkbox" name="timeConfirmed"> Klokkeslett er bekreftet – vis det i terminlisten</label>
+        <div class="field-grid two"><label>Arena<input type="text" name="venue" maxlength="160" required placeholder="Fosenhallen"></label><label>Rundenummer<input type="number" name="round" min="1" max="99" required></label></div>
+        <button class="btn" type="submit">Lagre endringer i terminlisten</button>
+      </form>
+      <div class="fixture-admin-divider"></div>
+      <form id="fixture-bulk-form" class="stack-form">
+        <h4>Flytt Fosen-runden (7. november)</h4>
+        <p class="form-hint">Marker bare kampene som skal flyttes. Kampene på Dalgård 7. november tas ikke med. Gamle klokkeslett blir merket som ubekreftet og skjult for publikum. Arena beholdes inntil den endres.</p>
+        <div class="fixture-bulk-list">${fosenRound.length?fosenRound.map(f=>`<label class="fixture-bulk-option"><input type="checkbox" name="fixtureIds" value="${e(f.id)}" ${fixtureMatch(f.id)?'disabled':'checked'}><span>${e(fixtureSummary(f))}${fixtureMatch(f.id)?' (resultat registrert – kan ikke masseflyttes)':''}</span></label>`).join(''):'<p>Fant ingen ikke-flyttede Fosen-kamper den 7. november. Se «Rediger kamp» over.</p>'}</div>
+        <label>Ny dato for markerte kamper<input type="date" name="newDate" value="2026-12-12" required></label>
+        <button class="btn secondary" type="submit" ${fosenRound.every(f=>!!fixtureMatch(f.id))||!fosenRound.length?'disabled':''}>Flytt valgte kamper til ny dato</button>
+      </form>
+      <div class="fixture-admin-divider"></div>
+      <form id="fixture-new-form" class="stack-form">
+        <h4>Legg til terminfestet kamp</h4>
+        <p class="form-hint">Brukes kun hvis kampen ikke finnes i listen. Sjekk spesielt Astor–Fosen før du oppretter en ny.</p>
+        <div class="field-grid two"><label>Hjemmelag<select name="home" required>${teamOptions('astor')}</select></label><label>Bortelag<select name="away" required>${teamOptions('fosen')}</select></label></div>
+        <div class="field-grid two"><label>Dato<input type="date" name="date" value="2026-12-12" required></label><label>Tid (valgfritt – tomt viser «Tid kommer»)<input type="time" name="time"></label></div>
+        <div class="field-grid two"><label>Arena<input type="text" name="venue" maxlength="160" value="Fosenhallen" required></label><label>Rundenummer<input type="number" name="round" min="1" max="99" required></label></div>
+        <button class="btn secondary" type="submit">Opprett ny terminfestet kamp</button>
+      </form>
+    </article>`;
+  }
+
   function adminPage() {
     const summary = summarize();
     const loggedIn = isLoggedIn();
@@ -867,13 +929,14 @@
                 <button class="btn" type="submit">Publiser innlegg</button>
               </form>
             </article>`:""}
+            ${canManageLeague()?fixtureAdminMarkup():''}
             ${canManageLeague()?`<article class="panel admin-panel admin-wide">
               <div class="panel-header"><h3>Registrer kampstatistikk</h3></div>
               <form id="match-form" class="stack-form">
                 <label>Velg terminfestet kamp (redigerer resultatet om det allerede er registrert)
                   <select name="fixtureId" id="admin-fixture-select" required>
                     <option value="">Velg kamp fra terminlisten</option>
-                    ${(state.fixtures||[]).slice().sort((a,b)=>a.date.localeCompare(b.date)||a.time.localeCompare(b.time)).map(f=>{const recorded=fixtureMatch(f.id);return `<option value="${e(f.id)}">${e(formatDate(f.date))} ${e(f.time)} · ${e(getTeam(f.home)?.name)} – ${e(getTeam(f.away)?.name)} ${recorded ? `· ${recorded.homeGoals}–${recorded.awayGoals}` : ''}</option>`}).join('')}
+                    ${(state.fixtures||[]).slice().sort((a,b)=>String(a.date).localeCompare(String(b.date))||String(a.time||'').localeCompare(String(b.time||''))).map(f=>{const recorded=fixtureMatch(f.id);return `<option value="${e(f.id)}">${e(formatDate(f.date))} ${e(f.time)} · ${e(getTeam(f.home)?.name)} – ${e(getTeam(f.away)?.name)} ${recorded ? `· ${recorded.homeGoals}–${recorded.awayGoals}` : ''}</option>`}).join('')}
                   </select>
                 </label>
                 <p id="match-existing-hint" class="form-hint">Velg kampen fra terminlisten før du registrerer resultatet.</p>
@@ -1142,6 +1205,58 @@
       return;
     }
 
+    if(form.id === 'fixture-edit-form') {
+      event.preventDefault();
+      if(!canManageLeague())return alert('Du har ikke tilgang til terminlisten.');
+      const data=new FormData(form),fixture=(state.fixtures||[]).find(f=>f.id===data.get('fixtureId'));
+      if(!fixture)return alert('Velg en eksisterende terminfestet kamp.');
+      const date=String(data.get('date')||''),time=String(data.get('time')||''),venue=String(data.get('venue')||'').trim(),round=Number(data.get('round'));
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||(time&&!/^\d{2}:\d{2}$/.test(time))||!venue||!Number.isInteger(round)||round<1)return alert('Kontroller dato, klokkeslett, arena og rundenummer.');
+      const other=state.fixtures.find(f=>f.id!==fixture.id&&f.date===date&&f.time===time&&f.home===fixture.home&&f.away===fixture.away);
+      if(other)return alert('En annen terminfestet kamp med samme lag, dato og klokkeslett finnes allerede.');
+      const timeConfirmed=data.get('timeConfirmed')==='on';
+      if(timeConfirmed&&!time)return alert('Oppgi klokkeslettet eller fjern haken for at det er bekreftet.');
+      const next={date,time,venue,round,timeConfirmed};
+      if(Object.keys(next).every(k=>next[k]===fixture[k]))return alert('Ingen endringer å lagre.');
+      if(fixtureMatch(fixture.id) && !confirm('Kampen har registrert resultat og statistikk. Endre dato, tid eller arena på denne kampen uten å endre resultatet?'))return;
+      rescheduleFixture(fixture,next);
+      if(await saveData()){alert('Terminlisten er oppdatert. Kamp-ID og eventuelt resultat er beholdt.');route();}
+      return;
+    }
+
+    if(form.id === 'fixture-bulk-form') {
+      event.preventDefault();
+      if(!canManageLeague())return alert('Du har ikke tilgang til terminlisten.');
+      const data=new FormData(form),ids=data.getAll('fixtureIds').map(String),newDate=String(data.get('newDate')||'');
+      if(!ids.length)return alert('Velg minst én kamp som skal flyttes.');
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(newDate))return alert('Velg gyldig dato.');
+      const selected=ids.map(id=>state.fixtures.find(f=>f.id===id));
+      if(selected.some(f=>!f))return alert('En av kampene finnes ikke. Last inn siden på nytt.');
+      if(selected.some(f=>fixtureMatch(f.id)))return alert('Kamp med resultat kan ikke masseflyttes. Bruk redigeringsskjemaet.');
+      if(selected.some(f=>f.date!=='2026-11-07'||!(/fosen/i.test(f.venue||'')||(['astor','fosen','dogs-k9'].includes(f.home)&&['astor','fosen','dogs-k9'].includes(f.away)))))return alert('Kun Fosen-runden 7. november kan masseflyttes her.');
+      const affected=selected.filter(f=>f.date!==newDate);
+      if(!affected.length)return alert('De markerte kampene har allerede denne datoen.');
+      const labels=affected.map(f=>'• '+fixtureSummary(f)).join('\n');
+      if(!confirm(`Flytte ${affected.length} kamper til ${formatDate(newDate)}?\n\n${labels}\n\nTidspunktene blir markert som ubekreftet, arena beholdes.`))return;
+      affected.forEach(f=>rescheduleFixture(f,{date:newDate,timeConfirmed:false}));
+      if(await saveData()){alert(`${affected.length} kamper flyttet til ${formatDate(newDate)}. Kontroller nye klokkeslett og arena i terminlisten.`);route();}
+      return;
+    }
+
+    if(form.id === 'fixture-new-form') {
+      event.preventDefault();
+      if(!canManageLeague())return alert('Du har ikke tilgang til terminlisten.');
+      const data=new FormData(form),home=String(data.get('home')||''),away=String(data.get('away')||''),date=String(data.get('date')||''),time=String(data.get('time')||''),venue=String(data.get('venue')||'').trim(),round=Number(data.get('round'));
+      if(!getTeam(home)||!getTeam(away)||home===away||!/^\d{4}-\d{2}-\d{2}$/.test(date)||(time&&!/^\d{2}:\d{2}$/.test(time))||!venue||!Number.isInteger(round)||round<1)return alert('Kontroller lag, dato, tid, arena og rundenummer.');
+      const existing=state.fixtures.find(f=>(f.home===home&&f.away===away||f.home===away&&f.away===home)&&f.date===date&&f.time===time);
+      if(existing)return alert('Denne kampen er allerede terminfestet på samme dato og tidspunkt. Rediger eksisterende kamp i stedet.');
+      const reminder=state.fixtures.filter(f=>(f.home===home&&f.away===away||f.home===away&&f.away===home));
+      if(reminder.length&&!confirm(`Disse lagene har allerede ${reminder.length} terminfestede oppgjør. Bekrefter du at dette skal være en NY kamp og ikke en flytting?`))return;
+      state.fixtures.push({id:'fixture-'+crypto.randomUUID(),round,date,time,home,away,venue,timeConfirmed:!!time});
+      if(await saveData()){alert('Kampen er lagt til i terminlisten. Du kan nå velge den under «Registrer kampstatistikk».');route();}
+      return;
+    }
+
     if (form.id === 'match-form') {
       event.preventDefault();
       const data = new FormData(form);
@@ -1211,6 +1326,19 @@
   });
 
   document.addEventListener('change', event => {
+    if(event.target.id==='fixture-edit-select') {
+      const fixture=state.fixtures.find(f=>f.id===event.target.value),form=document.getElementById('fixture-edit-form');
+      if(!form)return;
+      if(!fixture){form.elements.date.value='';form.elements.time.value='';form.elements.venue.value='';form.elements.round.value='';form.elements.timeConfirmed.checked=false;return;}
+      form.elements.date.value=fixture.date;
+      form.elements.time.value=fixture.time;
+      form.elements.venue.value=fixture.venue;
+      form.elements.round.value=fixture.round??1;
+      form.elements.timeConfirmed.checked=fixture.timeConfirmed!==false&&Boolean(fixture.time);
+      const preview=document.getElementById('fixture-edit-preview');
+      if(preview)preview.textContent=`${getTeam(fixture.home)?.name||fixture.home} – ${getTeam(fixture.away)?.name||fixture.away}. ${fixtureMatch(fixture.id)?'Kampen har registrert resultat.':'Resultat ikke registrert.'}${fixture.rescheduledFrom?.date?' Omberammet fra '+formatDate(fixture.rescheduledFrom.date)+'.':''}`;
+      return;
+    }
     if(event.target.id==='admin-fixture-select') {
       const f=(state.fixtures||[]).find(x=>x.id===event.target.value);
       const form=document.getElementById('match-form');
